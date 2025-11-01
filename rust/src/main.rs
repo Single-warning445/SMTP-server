@@ -1,0 +1,935 @@
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::TcpListener,
+    sync::{Semaphore, Mutex, RwLock},
+    time::Duration,
+};
+use std::{collections::{HashSet}, env, sync::Arc};
+use mailparse::{parse_mail, MailHeaderMap};
+use sqlx::postgres::{PgPool, PgPoolOptions};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use tracing::{info, warn, error};
+use tracing_subscriber;
+
+// Ban structure returned by Supabase
+#[derive(Debug, Deserialize, Serialize)]
+struct Ban {
+    scope: String,
+    value: String,
+    // Optional: match_type column in DB: 'exact' or 'contains'
+    match_type: Option<String>,
+}
+
+// In-memory ban cache
+#[derive(Debug, Default)]
+struct BansCache {
+    // global exact sender addresses
+    email_exact: HashSet<String>,
+    // global substrings to check
+    email_contains: Vec<String>,
+    // global blocked recipient domains
+    domain: HashSet<String>,
+}
+
+// Supabase inbox structure
+#[derive(Debug, Deserialize, Serialize)]
+struct Inbox {
+    id: String,
+    email_address: String,
+    user_id: Option<String>,
+}
+
+// Supabase domain structure
+#[derive(Debug, Deserialize)]
+struct Domain {
+    domain: String,
+}
+
+// Domain response for polling API
+#[derive(Deserialize)]
+struct DomainResponse {
+    domain: String,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    dotenv::dotenv().ok();
+    
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .with_thread_ids(false)
+        .with_file(false)
+        .with_line_number(false)
+        .compact()
+        .init();
+    info!("=== SMTP Service (Receive Only) ===");
+
+    // Environment variables
+    let database_url = env::var("DATABASE_URL")?;
+    
+    let supabase_url = env::var("SUPABASE_URL")?;
+    let supabase_key = env::var("SUPABASE_SERVICE_ROLE_KEY")
+        .or_else(|_| env::var("SUPABASE_KEY"))?;
+    let heartbeat_url = env::var("HEARTBEAT_URL").ok();
+    let listen_port: u16 = env::var("SMTP_RECEIVE_PORT").unwrap_or("25".into()).parse()?;
+
+    // Create PostgreSQL connection pool for temporary emails
+    let postgres_pool = PgPoolOptions::new()
+        .max_connections(20)
+        .connect(&database_url)
+        .await?;
+    info!("✓ Connected to PostgreSQL database");
+
+    // SurrealDB removed - using PostgreSQL for private emails
+
+    // Domain whitelist
+    let domain_whitelist: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    // No per-receiver scoping: this instance ignores receiver-specific bans
+
+    // Bans cache (email exact, contains, domain)
+    let bans_cache: Arc<RwLock<BansCache>> = Arc::new(RwLock::new(BansCache::default()));
+    
+    // Initialize domain whitelist from Supabase
+    if let Err(e) = load_domain_whitelist(&supabase_url, &supabase_key, domain_whitelist.clone()).await {
+        warn!("✗ Failed to load domain whitelist: {}", e);
+    }
+
+    // Perform an initial synchronous load of bans (same pattern as domains)
+    // so bans are populated before the listener starts, mirroring domain behavior.
+    load_bans(&supabase_url, &supabase_key, bans_cache.clone()).await;
+
+    // Start domain updates polling
+    let whitelist_clone = domain_whitelist.clone();
+    let supabase_url_clone = supabase_url.clone();
+    let supabase_key_clone = supabase_key.clone();
+    tokio::spawn(async move {
+        poll_domain_updates(supabase_url_clone, supabase_key_clone, whitelist_clone).await;
+    });
+
+    // Start bans polling (initial load + periodic refresh)
+    let bans_cache_clone = bans_cache.clone();
+    let supabase_url_clone2 = supabase_url.clone();
+    let supabase_key_clone2 = supabase_key.clone();
+    tokio::spawn(async move {
+        poll_bans(supabase_url_clone2, supabase_key_clone2, bans_cache_clone).await;
+    });
+
+    // Concurrency control
+    let semaphore = Arc::new(Semaphore::new(10));
+    let max_queue = 100;
+    let queue_counter = Arc::new(Mutex::new(0usize));
+
+    // Start TCP listener for SMTP
+    let listener = TcpListener::bind(("0.0.0.0", listen_port)).await?;
+    info!("✓ SMTP Receiver running on port {}", listen_port);
+
+    loop {
+    let (socket, addr) = listener.accept().await?;
+        
+        let postgres_pool = postgres_pool.clone();
+        let whitelist = domain_whitelist.clone();
+        let supabase_url = supabase_url.clone();
+        let supabase_key = supabase_key.clone();
+            let bans_cache = bans_cache.clone();
+        let semaphore = semaphore.clone();
+        let queue_counter = queue_counter.clone();
+        let heartbeat_url = heartbeat_url.clone();
+
+        tokio::spawn(async move {
+            let _permit = semaphore.acquire().await.unwrap();
+            let queue_size = {
+                let mut q = queue_counter.lock().await;
+                if *q >= max_queue {
+                    warn!("Server busy, rejecting connection {} [Queue: {}/{}]", addr, *q, max_queue);
+                    return;
+                }
+                *q += 1;
+                *q
+            };
+
+            info!("[SMTP IN] New connection from {} -> local [Queue: {}/{}]", addr, queue_size, max_queue);
+            if let Err(e) = handle_smtp(socket, postgres_pool, whitelist, supabase_url, supabase_key, heartbeat_url, bans_cache).await {
+                error!("Error handling {}: {:?}", addr, e);
+            }
+
+            let queue_size = {
+                let mut q = queue_counter.lock().await;
+                *q -= 1;
+                *q
+            };
+            info!("[SMTP OUT] Connection closed from {} [Queue: {}/{}]", addr, queue_size, max_queue);
+        });
+    }
+}
+
+// SMTP handler
+async fn handle_smtp(
+    socket: tokio::net::TcpStream,
+    postgres_pool: PgPool,
+    whitelist: Arc<Mutex<HashSet<String>>>,
+    supabase_url: String,
+    supabase_key: String,
+    heartbeat_url: Option<String>,
+    bans_cache: Arc<RwLock<BansCache>>,
+) -> anyhow::Result<()> {
+    let (reader, mut writer) = socket.into_split();
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+
+    writer.write_all(b"220 Cybertemp Mail Receiver\r\n").await?;
+
+    let mut mail_from = String::new();
+    let mut rcpt_to = String::new();
+    let mut data_mode = false;
+    let mut email_data = Vec::new();
+
+    loop {
+        line.clear();
+        let bytes = reader.read_line(&mut line).await?;
+        if bytes == 0 { break; }
+        let cmd = line.trim_end();
+
+        if data_mode {
+            if cmd == "." {
+                data_mode = false;
+                info!("[SMTP IN] DATA stream completed");
+                match process_email(&email_data, &rcpt_to, &mail_from, &postgres_pool, &supabase_url, &supabase_key, &whitelist, heartbeat_url.clone(), &bans_cache).await {
+                    Ok(_) => {
+                        writer.write_all(b"250 Ok: Message accepted\r\n").await?;
+                        info!("✓ Email processed successfully");
+                    },
+                    Err(e) => {
+                        error!("Failed to process email: {}", e);
+                        writer.write_all(b"451 Temporary failure in email processing\r\n").await?;
+                    }
+                }
+                email_data.clear();
+            } else {
+                email_data.push(cmd.to_string());
+            }
+            continue;
+        }
+
+        if cmd.starts_with("HELO") || cmd.starts_with("EHLO") {
+            let hostname = cmd.split_whitespace().nth(1).unwrap_or("unknown");
+            info!("[SMTP IN] {} from {}", cmd.split_whitespace().next().unwrap_or("HELO"), hostname);
+            writer.write_all(b"250 Hello\r\n").await?;
+        } else if cmd.starts_with("MAIL FROM:") {
+            mail_from = cmd[10..].trim().to_string();
+            info!("[SMTP IN] MAIL FROM: {}", mail_from);
+            writer.write_all(b"250 Ok\r\n").await?;
+        } else if cmd.starts_with("RCPT TO:") {
+            rcpt_to = cmd[8..].trim().to_string();
+            let email = extract_email(&rcpt_to);
+            let domain = email.split('@').nth(1).unwrap_or("").to_lowercase();
+            
+            let whitelist_guard = whitelist.lock().await;
+            let domain_allowed = if whitelist_guard.is_empty() {
+                warn!("[Domains] No domains loaded - allowing all domains");
+                true
+            } else {
+                is_domain_allowed(&domain, &whitelist_guard)
+            };
+            drop(whitelist_guard);
+            
+            if !domain_allowed {
+                warn!("[Domains] Rejected RCPT TO: {} (domain not allowed)", email);
+                writer.write_all(b"550 Domain not allowed\r\n").await?;
+            } else {
+                // Check domain bans from in-memory cache
+                    // domain bans: check global bans
+                    if is_domain_banned(&domain, &bans_cache).await {
+                        warn!("[Bans] Rejected RCPT TO: {} (domain banned)", email);
+                        writer.write_all(b"550 Domain banned\r\n").await?;
+                    } else {
+                        info!("[SMTP IN] RCPT TO: {}", email);
+                        writer.write_all(b"250 Ok\r\n").await?;
+                    }
+            }
+        } else if cmd == "DATA" {
+            data_mode = true;
+            info!("[SMTP IN] DATA command received");
+            writer.write_all(b"354 End data with <CR><LF>.<CR><LF>\r\n").await?;
+        } else if cmd == "QUIT" {
+            info!("[SMTP IN] QUIT command received");
+            writer.write_all(b"221 Bye\r\n").await?;
+            break;
+        } else if cmd == "RSET" {
+            info!("[SMTP IN] RSET command received");
+            mail_from.clear();
+            rcpt_to.clear();
+            email_data.clear();
+            data_mode = false;
+            writer.write_all(b"250 Ok\r\n").await?;
+        } else if cmd == "NOOP" {
+            info!("[SMTP IN] NOOP command received");
+            writer.write_all(b"250 Ok\r\n").await?;
+        } else {
+            warn!("[SMTP IN] Unknown command: {}", cmd);
+            writer.write_all(b"502 Command not implemented\r\n").await?;
+        }
+    }
+
+    Ok(())
+}
+
+fn extract_email(addr: &str) -> String {
+    if addr.starts_with('<') && addr.ends_with('>') {
+        addr[1..addr.len()-1].to_string()
+    } else {
+        addr.to_string()
+    }
+}
+
+// Process email content - FIXED VERSION
+async fn process_email(
+    data: &Vec<String>,
+    rcpt_to: &str,
+    mail_from: &str,
+    postgres_pool: &PgPool,
+    supabase_url: &str,
+    supabase_key: &str,
+    whitelist: &Arc<Mutex<HashSet<String>>>,
+    heartbeat_url: Option<String>,
+    bans_cache: &Arc<RwLock<BansCache>>,
+) -> anyhow::Result<()> {
+    // Join all email data lines with CRLF (SMTP standard)
+    let raw_email = data.join("\r\n");
+    
+    info!("📧 Processing email - Raw size: {} bytes", raw_email.len());
+
+    let recipient_email = extract_email(rcpt_to).to_lowercase();
+    let from_address = extract_email(mail_from).to_lowercase();
+
+    let domain = recipient_email.split('@').nth(1).unwrap_or("").to_lowercase();
+    let whitelist_guard = whitelist.lock().await;
+    let domain_allowed = if whitelist_guard.is_empty() {
+        true
+    } else {
+        is_domain_allowed(&domain, &whitelist_guard)
+    };
+    drop(whitelist_guard);
+    
+    if !domain_allowed {
+        warn!("[Domains] Email dropped - domain not allowed: {}", recipient_email);
+        return Ok(());
+    }
+
+    // Check bans cache for recipient domain ban
+    if is_domain_banned(&domain, bans_cache).await {
+        warn!("[Bans] Dropped email to banned domain: {}", recipient_email);
+        return Ok(());
+    }
+
+    // Check bans cache for sender (exact + contains)
+    let from_lower = from_address.to_lowercase();
+    if is_email_banned(&from_lower, bans_cache).await {
+        warn!("[Bans] Dropped email from banned sender: {} -> {}", from_lower, recipient_email);
+        return Ok(());
+    }
+
+    // Parse subject from raw email headers using mailparse for proper MIME decoding
+    let subject = match parse_mail(raw_email.as_bytes()) {
+        Ok(parsed) => {
+            parsed.get_headers().get_first_value("Subject")
+                .unwrap_or_else(|| "No Subject".to_string())
+        }
+        Err(_) => {
+            // Fallback to manual extraction if parsing fails
+            extract_subject_from_raw(&raw_email).unwrap_or_else(|| "No Subject".to_string())
+        }
+    };
+    
+    info!("✉ Parsed email for {} from {} - Subject: '{}'", recipient_email, from_address, subject);
+
+    // First check if this is a private email (Postgres)
+    match sqlx::query("SELECT id FROM private_email WHERE email = $1 LIMIT 1")
+        .bind(&recipient_email)
+        .fetch_optional(postgres_pool)
+        .await
+    {
+        Ok(opt) => {
+            if opt.is_some() {
+                // Save directly into Postgres emails table for private users using the raw email as body
+                let to_addrs_vec_local = vec![recipient_email.clone()];
+                let insert_res = sqlx::query(
+                    "INSERT INTO emails (mailbox_owner, mailbox, subject, body, html, from_addr, to_addrs, size, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())"
+                )
+                .bind(&recipient_email)
+                .bind("INBOX")
+                .bind(&subject)
+                .bind(&raw_email)
+                .bind(None::<String>)
+                .bind(&from_address)
+                .bind(&to_addrs_vec_local)
+                .bind(raw_email.len() as i64)
+                .execute(postgres_pool)
+                .await;
+
+                match insert_res {
+                    Ok(_res) => {
+                        info!("✓ Saved email for private user in Postgres: {} -> {}", from_address, recipient_email);
+                        // Update last_updated_at for the private_email row
+                        let _ = sqlx::query("UPDATE private_email SET last_updated_at = NOW() WHERE email = $1")
+                            .bind(&recipient_email)
+                            .execute(postgres_pool)
+                            .await;
+
+                        if let Some(url) = heartbeat_url {
+                            send_heartbeat(&url).await;
+                        }
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        error!("Failed to save private email to Postgres: {:?}", e);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            error!("Error checking private_email in Postgres: {:?}", e);
+        }
+    }
+
+    // Handle as temp email - save to PostgreSQL
+    let client = Client::new();
+
+    // Get or create inbox and parse email in parallel
+    let raw_email_clone = raw_email.clone();
+    let ( _ , parsed_result ) = tokio::join!(
+        get_or_create_inbox(&client, supabase_url, supabase_key, &recipient_email),
+        tokio::task::spawn_blocking(move || {
+            let data = raw_email_clone;
+            let bodies_result = match parse_mail(data.as_bytes()) {
+                Ok(parsed) => {
+                    let mut text_body = String::new();
+                    let mut html_body = String::new();
+
+                    // If no subparts, try top-level body
+                    if parsed.subparts.is_empty() {
+                        if let Ok(b) = parsed.get_body() {
+                            if let Some(ct) = parsed.get_headers().get_first_value("Content-Type") {
+                                let ct_l = ct.to_lowercase();
+                                if ct_l.contains("text/html") {
+                                    html_body = b;
+                                } else {
+                                    text_body = b;
+                                }
+                            } else {
+                                text_body = b;
+                            }
+                        }
+                    } else {
+                        for sub in &parsed.subparts {
+                            if let Some(ct) = sub.get_headers().get_first_value("Content-Type") {
+                                let ct_l = ct.to_lowercase();
+                                if ct_l.contains("text/html") {
+                                    if let Ok(b) = sub.get_body() { html_body = b; }
+                                } else if ct_l.contains("text/plain") {
+                                    if let Ok(b) = sub.get_body() { text_body = b; }
+                                } else {
+                                    if text_body.is_empty() {
+                                        if let Ok(b) = sub.get_body() { text_body = b; }
+                                    }
+                                }
+                            } else {
+                                if text_body.is_empty() {
+                                    if let Ok(b) = sub.get_body() { text_body = b; }
+                                }
+                            }
+                        }
+                    }
+
+                    if text_body.trim().is_empty() {
+                        if let Ok(b) = parsed.get_body() { text_body = b; }
+                    }
+
+                    if text_body.trim().is_empty() && html_body.trim().is_empty() {
+                        // Strip headers from raw email to avoid saving signatures and metadata
+                        let body_only = strip_email_headers(&data);
+                        text_body = body_only;
+                    }
+
+                    Ok((text_body, html_body))
+                }
+                Err(e) => Err(e)
+            };
+            (data, bodies_result)
+        })
+    );
+
+    let (raw_email_owned, bodies_result) = match parsed_result {
+        Ok((d, br)) => (d, br),
+        Err(e) => {
+            warn!("spawn_blocking failed, falling back to raw body: {}", e);
+            // fallback: save raw as plain text
+            let subject = "No Subject".to_string();
+            let text_body = raw_email.clone();
+            let html_body = String::new();
+
+            let to_addrs_vec = vec![recipient_email.clone()];
+            info!("Saving to PostgreSQL (fallback): mailbox_owner={}, mailbox=INBOX, subject={}, from={}, size={}", recipient_email, subject, from_address, text_body.len());
+
+            let insert_res = sqlx::query(
+                "INSERT INTO emails (mailbox_owner, mailbox, subject, body, html, from_addr, to_addrs, size, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())"
+            )
+            .bind(&recipient_email)
+            .bind("INBOX")
+            .bind(&subject)
+            .bind(&raw_email)
+            .bind(&html_body)
+            .bind(&from_address)
+            .bind(&to_addrs_vec)
+            .bind(raw_email.len() as i64)
+            .execute(postgres_pool)
+            .await;
+
+            match insert_res {
+                Err(e) => {
+                    error!("Failed to save email to PostgreSQL (fallback): {}", e);
+                    error!("Attempted insert values: mailbox_owner={}, subject={}, from={}, to_addrs={:?}, size={}", recipient_email, subject, from_address, to_addrs_vec, raw_email.len());
+                }
+                Ok(res) => {
+                    info!("✓ Saved email to PostgreSQL (fallback). Rows affected: {}", res.rows_affected());
+                }
+            }
+
+            if let Some(url) = heartbeat_url {
+                send_heartbeat(&url).await;
+            }
+
+            return Ok(());
+        }
+    };
+
+    let (text_body, html_body) = match bodies_result {
+        Ok((t, h)) => (t, h),
+        Err(e) => {
+            warn!("mailparse failed to parse message, falling back to raw body: {}", e);
+            // fallback: save raw as plain text
+            let text_body = raw_email_owned.clone();
+            let html_body = String::new();
+
+            let to_addrs_vec = vec![recipient_email.clone()];
+            info!("Saving to PostgreSQL (fallback): mailbox_owner={}, mailbox=INBOX, subject={}, from={}, size={}", recipient_email, subject, from_address, text_body.len());
+
+            let insert_res = sqlx::query(
+                "INSERT INTO emails (mailbox_owner, mailbox, subject, body, html, from_addr, to_addrs, size, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())"
+            )
+            .bind(&recipient_email)
+            .bind("INBOX")
+            .bind(&subject)
+            .bind(&raw_email_owned)
+            .bind(&html_body)
+            .bind(&from_address)
+            .bind(&to_addrs_vec)
+            .bind(raw_email_owned.len() as i64)
+            .execute(postgres_pool)
+            .await;
+
+            match insert_res {
+                Err(e) => {
+                    error!("Failed to save email to PostgreSQL (fallback): {}", e);
+                    error!("Attempted insert values: mailbox_owner={}, subject={}, from={}, to_addrs={:?}, size={}", recipient_email, subject, from_address, to_addrs_vec, raw_email_owned.len());
+                }
+                Ok(res) => {
+                    info!("✓ Saved email to PostgreSQL (fallback). Rows affected: {}", res.rows_affected());
+                }
+            }
+
+            if let Some(url) = heartbeat_url {
+                send_heartbeat(&url).await;
+            }
+
+            return Ok(());
+        }
+    };
+
+    let to_addrs_vec = vec![recipient_email.clone()];
+    info!("Saving to PostgreSQL: mailbox_owner={}, mailbox=INBOX, subject={}, from={}, text_len={}, html_len={}", recipient_email, subject, from_address, text_body.len(), html_body.len());
+
+    match sqlx::query(
+        "INSERT INTO emails (mailbox_owner, mailbox, subject, body, html, from_addr, to_addrs, size, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())"
+    )
+    .bind(&recipient_email)
+    .bind("INBOX")
+    .bind(&subject)
+    .bind(&text_body)
+    .bind(&html_body)
+    .bind(&from_address)
+    .bind(&to_addrs_vec)
+    .bind(raw_email_owned.len() as i64)
+    .execute(postgres_pool)
+    .await {
+        Ok(result) => {
+            info!("✓ Saved email to PostgreSQL. Rows affected: {}", result.rows_affected());
+            info!("✓ Email text size: {} bytes, html size: {} bytes", text_body.len(), html_body.len());
+        }
+        Err(e) => {
+            error!("Failed to save email to PostgreSQL: {}", e);
+            error!("PostgreSQL error details: {:?}", e);
+            error!("Attempted insert values: mailbox_owner={}, subject={}, from={}, to_addrs={:?}, text_len={}, html_len={}", recipient_email, subject, from_address, to_addrs_vec, text_body.len(), html_body.len());
+        }
+    }
+
+    if let Some(url) = heartbeat_url {
+        send_heartbeat(&url).await;
+    }
+
+    Ok(())
+}
+
+// Helper function to extract subject from raw email (fallback only)
+fn extract_subject_from_raw(raw_email: &str) -> Option<String> {
+    for line in raw_email.lines() {
+        if line.to_lowercase().starts_with("subject:") {
+            return Some(line[8..].trim().to_string());
+        }
+    }
+    None
+}
+
+// Helper function to strip email headers from raw email content
+fn strip_email_headers(raw_email: &str) -> String {
+    let mut in_headers = true;
+    let mut result = String::new();
+    
+    for line in raw_email.lines() {
+        if in_headers {
+            // Empty line marks end of headers
+            if line.trim().is_empty() {
+                in_headers = false;
+            }
+            // Skip header lines (but keep them out of the body)
+        } else {
+            // We're in the body now
+            if result.is_empty() {
+                result.push_str(line);
+            } else {
+                result.push_str("\r\n");
+                result.push_str(line);
+            }
+        }
+    }
+    
+    // If we didn't find a body separator, return a truncated version to avoid signatures
+    if in_headers && result.is_empty() {
+        // Find the first occurrence of common body markers or just take a reasonable portion
+        if let Some(body_start) = raw_email.find("\r\n\r\n") {
+            let body = &raw_email[body_start + 4..];
+            // Limit to first 2000 chars to avoid including signatures/metadata
+            if body.len() > 2000 {
+                body.chars().take(2000).collect()
+            } else {
+                body.to_string()
+            }
+        } else {
+            // No clear body separator, take first 1000 chars
+            raw_email.chars().take(1000).collect()
+        }
+    } else {
+        result
+    }
+}
+
+async fn get_or_create_inbox(client: &Client, supabase_url: &str, supabase_key: &str, email: &str) -> anyhow::Result<String> {
+    let api_url = format!("{}/rest/v1/inbox?email_address=eq.{}", supabase_url, email);
+    match client
+        .get(&api_url)
+        .header("apikey", supabase_key)
+        .header("Authorization", format!("Bearer {}", supabase_key))
+        .send()
+        .await {
+            Ok(response) => {
+                match response.json::<Vec<Inbox>>().await {
+                    Ok(inbox_res) => {
+                        if let Some(inbox) = inbox_res.first() {
+                            return Ok(inbox.id.clone());
+                        }
+                    }
+                    Err(e) => {
+                        warn!("⚠ Failed to parse Supabase response: {}", e);
+                        return Err(anyhow::anyhow!("Supabase parse error: {}", e));
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("⚠ Failed to check Supabase inbox: {}", e);
+                return Err(anyhow::anyhow!("Supabase connection error: {}", e));
+            }
+        }
+
+    // Create new inbox if it doesn't exist (user_id can be None)
+    let create_url = format!("{}/rest/v1/inbox", supabase_url);
+    match client
+        .post(&create_url)
+        .header("apikey", supabase_key)
+        .header("Authorization", format!("Bearer {}", supabase_key))
+        .header("Content-Type", "application/json")
+        .header("Prefer", "return=representation")
+        .json(&serde_json::json!({ "email_address": email }))
+        .send()
+        .await {
+            Ok(response) => {
+                match response.json::<Vec<Inbox>>().await {
+                    Ok(created) => {
+                        let inbox_id = created.first()
+                            .ok_or_else(|| anyhow::anyhow!("Failed to create inbox"))?
+                            .id.clone();
+                        info!("✓ Created inbox in Supabase: {}", inbox_id);
+                        Ok(inbox_id)
+                    }
+                    Err(e) => {
+                        warn!("⚠ Failed to parse Supabase creation response: {}", e);
+                        Err(anyhow::anyhow!("Supabase creation parse error: {}", e))
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("⚠ Failed to create Supabase inbox: {}", e);
+                Err(anyhow::anyhow!("Supabase creation error: {}", e))
+            }
+        }
+}
+
+async fn send_heartbeat(url: &str) {
+    match Client::new().get(url).send().await {
+        Ok(response) => {
+            if response.status().is_success() {
+                info!("✓ Heartbeat sent successfully");
+            } else {
+                warn!("⚠ Heartbeat failed: {}", response.status());
+            }
+        },
+        Err(e) => {
+            error!("✗ Heartbeat error: {}", e);
+        }
+    }
+}
+
+fn is_domain_allowed(domain: &str, whitelist: &HashSet<String>) -> bool {
+    if whitelist.is_empty() {
+        return true;
+    }
+    
+    let domain_lower = domain.to_lowercase();
+    
+    if whitelist.contains(&domain_lower) {
+        return true;
+    }
+    
+    if whitelist.contains(&format!("*.{}", domain_lower)) {
+        return true;
+    }
+    
+    for whitelisted_domain in whitelist {
+        if whitelisted_domain.starts_with("*.") {
+            let base_domain = &whitelisted_domain[2..];
+            if domain_lower.ends_with(base_domain) {
+                if domain_lower == base_domain || domain_lower.ends_with(&format!(".{}", base_domain)) {
+                    return true;
+                }
+            }
+        }
+    }
+    
+    false
+}
+
+async fn load_domain_whitelist(
+    supabase_url: &str,
+    supabase_key: &str,
+    whitelist: Arc<Mutex<HashSet<String>>>,
+) -> anyhow::Result<()> {
+    let client = Client::new();
+    let api_url = format!("{}/rest/v1/domains", supabase_url);
+    match client
+        .get(&api_url)
+        .header("apikey", supabase_key)
+        .header("Authorization", format!("Bearer {}", supabase_key))
+        .send()
+        .await {
+            Ok(response) => {
+                match response.json::<Vec<Domain>>().await {
+                    Ok(res) => {
+                        let mut wl = whitelist.lock().await;
+                        for domain in res {
+                            let domain_lower = domain.domain.to_lowercase();
+                            wl.insert(domain_lower.clone());
+                            if !domain_lower.starts_with("*.") {
+                                wl.insert(format!("*.{}", domain_lower));
+                            }
+                        }
+                        info!("✅ Loaded {} whitelisted domains from Supabase", wl.len() / 2);
+                        if wl.is_empty() {
+                            warn!("⚠ No domains configured - all emails will be accepted");
+                        }
+                        Ok(())
+                    }
+                    Err(e) => {
+                        warn!("⚠ Failed to parse Supabase domains response: {}", e);
+                        Err(anyhow::anyhow!("Supabase parse error: {}", e))
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("⚠ Failed to load domains from Supabase: {}", e);
+                warn!("📧 SMTP server will accept all domains until connection is restored");
+                Err(anyhow::anyhow!("Supabase connection error: {}", e))
+            }
+        }
+}
+
+async fn poll_domain_updates(
+    supabase_url: String,
+    supabase_key: String,
+    whitelist: Arc<Mutex<HashSet<String>>>,
+) {
+    let client = Client::new();
+    let mut poll_interval = tokio::time::interval(Duration::from_secs(60));
+    
+    loop {
+        poll_interval.tick().await;
+        
+        info!("🔄 Polling Supabase for domain updates...");
+        
+        let url = format!("{}/rest/v1/domains?select=domain", supabase_url);
+        
+        match client
+            .get(&url)
+            .header("apikey", &supabase_key)
+            .header("Authorization", format!("Bearer {}", supabase_key))
+            .send()
+            .await
+        {
+            Ok(response) => {
+                if response.status().is_success() {
+                    match response.json::<Vec<DomainResponse>>().await {
+                        Ok(domains) => {
+                            let mut wl = whitelist.lock().await;
+                            wl.clear();
+                            
+                            for domain_response in domains {
+                                let domain_lower = domain_response.domain.to_lowercase();
+                                wl.insert(domain_lower.clone());
+                                if !domain_lower.starts_with("*.") {
+                                    wl.insert(format!("*.{}", domain_lower));
+                                }
+                            }
+                            
+                            info!("✅ Updated {} domains from Supabase", wl.len() / 2);
+                        }
+                        Err(e) => {
+                            warn!("⚠ Failed to parse domains response: {}", e);
+                        }
+                    }
+                } else {
+                    warn!("⚠ Failed to fetch domains: HTTP {}", response.status());
+                }
+            }
+            Err(e) => {
+                warn!("⚠ Failed to connect to Supabase for domain polling: {}", e);
+            }
+        }
+    }
+}
+
+async fn load_bans(supabase_url: &str, supabase_key: &str, bans_cache: Arc<RwLock<BansCache>>) {
+    let client = Client::new();
+    let url = format!("{}/rest/v1/bans?status=eq.active", supabase_url);
+
+    match client
+        .get(&url)
+        .header("apikey", supabase_key)
+        .header("Authorization", format!("Bearer {}", supabase_key))
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status();
+            if status.is_success() {
+                match resp.json::<Vec<Ban>>().await {
+                    Ok(rows) => {
+                        let mut cache = BansCache::default();
+                        for b in rows {
+                            let scope = b.scope.to_lowercase();
+                            let mut val = b.value.trim().to_lowercase();
+                            let mtype = b.match_type.unwrap_or_else(|| "exact".to_string()).to_lowercase();
+                            match scope.as_str() {
+                                "email" => {
+                                    if mtype == "contains" {
+                                        if val.starts_with("contains:") {
+                                            val = val["contains:".len()..].to_string();
+                                        }
+                                        cache.email_contains.push(val.clone());
+                                    } else {
+                                        cache.email_exact.insert(val.clone());
+                                    }
+                                }
+                                "domain" => {
+                                    cache.domain.insert(val.clone());
+                                }
+                                _ => {}
+                            }
+                        }
+                        // Swap caches atomically
+                        let mut guard = bans_cache.write().await;
+                        *guard = cache;
+                        info!("✅ Loaded bans (global_exact={}, global_contains={}, global_domains={})", guard.email_exact.len(), guard.email_contains.len(), guard.domain.len());
+                    }
+                    Err(e) => {
+                        warn!("⚠ Failed to parse bans JSON: {}", e);
+                    }
+                }
+            } else {
+                // read response body for diagnostics (avoid logging secrets)
+                match resp.text().await {
+                    Ok(body) => warn!("⚠ Bans fetch HTTP {}. Body: {}", status, body),
+                    Err(e) => warn!("⚠ Bans fetch HTTP {} and failed to read body: {}", status, e),
+                }
+            }
+        }
+        Err(e) => {
+            warn!("⚠ Failed to connect to Supabase for bans polling: {:?}", e);
+            warn!("   reqwest::Error::is_timeout() = {} | status = {:?}", e.is_timeout(), e.status());
+        }
+    }
+}
+
+async fn poll_bans(supabase_url: String, supabase_key: String, bans_cache: Arc<RwLock<BansCache>>) {
+    let mut poll_interval = tokio::time::interval(Duration::from_secs(30));
+    // Initial load
+    load_bans(&supabase_url, &supabase_key, bans_cache.clone()).await;
+    loop {
+        poll_interval.tick().await;
+        info!("🔄 Polling Supabase for bans updates...");
+        load_bans(&supabase_url, &supabase_key, bans_cache.clone()).await;
+    }
+}
+
+// Helper: check if a domain is banned globally
+async fn is_domain_banned(domain: &str, bans_cache: &Arc<RwLock<BansCache>>) -> bool {
+    let guard = bans_cache.read().await;
+    let domain_lower = domain.to_lowercase();
+    if guard.domain.contains(&domain_lower) {
+        return true;
+    }
+    false
+}
+
+// Helper: check if an email/from address is banned (global exact/contains)
+async fn is_email_banned(from_lower: &str, bans_cache: &Arc<RwLock<BansCache>>) -> bool {
+    let guard = bans_cache.read().await;
+    // global exact
+    if guard.email_exact.contains(from_lower) {
+        return true;
+    }
+    // global contains
+    for sub in &guard.email_contains {
+        if from_lower.contains(sub) {
+            return true;
+        }
+    }
+    false
+}
