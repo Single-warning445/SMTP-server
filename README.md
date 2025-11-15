@@ -44,9 +44,9 @@ This server is designed as a **receive-only SMTP server** that:
 
 - Accepts incoming emails on port 25 (or custom port)
 - Stores temporary emails in PostgreSQL
-- Integrates with Supabase for inbox management
+- Manages inboxes in PostgreSQL (self-hosted)
 - Supports private email accounts (optional feature used by Cybertemp)
-- Implements domain whitelisting and email/domain banning
+- Implements domain whitelisting and email/domain banning (optional Supabase integration)
 - Handles concurrent connections efficiently with Tokio async runtime
 
 ---
@@ -71,8 +71,8 @@ This server is designed as a **receive-only SMTP server** that:
          ├─────────────────┬────────────────┐
          ▼                 ▼                ▼
 ┌─────────────────┐ ┌──────────────┐ ┌──────────────┐
-│   PostgreSQL    │ │   Supabase   │ │  Heartbeat   │
-│  (Temp Emails)  │ │  (Inboxes)   │ │  Monitoring  │
+│   PostgreSQL    │ │   PostgreSQL │ │  Heartbeat   │
+│  (Temp Emails)  │ │   (Inboxes)  │ │  Monitoring  │
 └─────────────────┘ └──────────────┘ └──────────────┘
 ```
 
@@ -87,7 +87,7 @@ This server is designed as a **receive-only SMTP server** that:
 - ✅ **Ban System**: Block emails from specific senders/domains
 - ✅ **MIME Parsing**: Proper handling of plain text and HTML emails
 - ✅ **PostgreSQL Storage**: Reliable email storage with indexing
-- ✅ **Supabase Integration**: Automatic inbox management
+- ✅ **Self-hosted Inboxes**: Automatic inbox management in PostgreSQL
 - ✅ **Connection Pooling**: Efficient database connections
 - ✅ **Queue Management**: Prevents server overload with request limits
 - ✅ **Heartbeat Monitoring**: Optional uptime monitoring endpoint
@@ -99,8 +99,7 @@ This server is designed as a **receive-only SMTP server** that:
 ## 📋 Prerequisites
 
 - **Rust** 1.70+ (for compilation)
-- **PostgreSQL** 12+ (for email storage)
-- **Supabase Account** (for inbox/domain management)
+- **PostgreSQL** 12+ (for email storage and inbox management)
 - **Linux/Windows/macOS** (any platform supporting Rust)
 - **Port 25 Access** (or alternative SMTP port - requires root/admin on Linux for port 25)
 
@@ -149,10 +148,6 @@ Create a `.env` file in the `rust/` directory with the following variables:
 # PostgreSQL Database (REQUIRED)
 DATABASE_URL=postgresql://username:password@localhost:5432/cybertemp
 
-# Supabase Configuration (REQUIRED)
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_SERVICE_ROLE_KEY=your-service-role-key-here
-
 # SMTP Server Settings (OPTIONAL)
 SMTP_RECEIVE_PORT=25                    # Default: 25 (use 2525 for non-root testing)
 
@@ -162,13 +157,13 @@ HEARTBEAT_URL=https://your-monitoring-service.com/ping
 
 ### Environment Variables Explained
 
-| Variable                    | Required | Description                                     |
-| --------------------------- | -------- | ----------------------------------------------- |
-| `DATABASE_URL`              | ✅ Yes   | PostgreSQL connection string for storing emails |
-| `SUPABASE_URL`              | ✅ Yes   | Your Supabase project URL                       |
-| `SUPABASE_SERVICE_ROLE_KEY` | ✅ Yes   | Supabase service role key (NOT anon key)        |
-| `SMTP_RECEIVE_PORT`         | ❌ No    | SMTP port (default: 25)                         |
-| `HEARTBEAT_URL`             | ❌ No    | Uptime monitoring ping URL                      |
+| Variable                    | Required | Default | Description                                     |
+| --------------------------- | -------- | ------- | ----------------------------------------------- |
+| `DATABASE_URL`              | ✅ Yes   | -       | PostgreSQL connection string for storing emails |
+| `SMTP_RECEIVE_PORT`         | ❌ No    | 25      | SMTP port (default: 25)                         |
+| `HEARTBEAT_URL`             | ❌ No    | -       | Uptime monitoring ping URL                      |
+| `USE_SUPABASE_BANS`         | ❌ No    | true    | Enable/disable Supabase ban system              |
+| `USE_SUPABASE_DOMAINS`      | ❌ No    | true    | Enable/disable Supabase domain whitelist        |
 
 ---
 
@@ -185,14 +180,15 @@ psql -U your_user -d cybertemp -f rust/SQL/schema.sql
 This creates:
 
 - `emails` table - stores all temporary emails
+- `inbox` table - stores inbox information (self-hosted)
 - `private_email` table - optional private email accounts (see below)
 - Necessary indexes for performance
 
-### Supabase Tables
+### Optional Supabase Tables (for advanced features)
 
-You need to create these tables in your Supabase project:
+If you want to use domain whitelisting and ban management, create these tables in Supabase:
 
-#### 1. `domains` table (Domain Whitelist)
+#### 1. `domains` table (Domain Whitelist - Optional)
 
 ```sql
 CREATE TABLE domains (
@@ -208,18 +204,7 @@ INSERT INTO domains (domain) VALUES
   ('*.example.com');  -- Wildcard support
 ```
 
-#### 2. `inbox` table (Inbox Management)
-
-```sql
-CREATE TABLE inbox (
-  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-  email_address TEXT NOT NULL UNIQUE,
-  user_id UUID,  -- Optional: link to auth.users
-  created_at TIMESTAMPTZ DEFAULT NOW()
-);
-```
-
-#### 3. `bans` table (Email/Domain Blocking)
+#### 2. `bans` table (Email/Domain Blocking - Optional)
 
 ```sql
 CREATE TABLE bans (
@@ -237,6 +222,8 @@ INSERT INTO bans (scope, value, match_type, status) VALUES
   ('email', 'spam', 'contains', 'active'),  -- Blocks any email containing "spam"
   ('domain', 'spammer.com', 'exact', 'active');
 ```
+
+**Note**: If you don't create these Supabase tables, set `USE_SUPABASE_BANS=false` and `USE_SUPABASE_DOMAINS=false` in your `.env` file. The server will accept all domains and have no bans by default.
 
 ---
 
@@ -315,12 +302,12 @@ sudo systemctl status cybertemp-smtp
 6. **Parsing**: Email is parsed using `mailparse` crate
 7. **Storage Decision**:
    - If recipient is in `private_email` table → Store in PostgreSQL `emails` table
-   - Otherwise → Store in PostgreSQL as temporary email + create Supabase inbox
+   - Otherwise → Store in PostgreSQL as temporary email + create PostgreSQL inbox entry
 8. **Response**: Server responds with `250 Ok: Message accepted`
 
 ### Domain Whitelisting
 
-The server **only accepts emails** for domains listed in Supabase `domains` table. This prevents abuse and unauthorized usage.
+The server **only accepts emails** for domains listed in the configured domain source (Supabase `domains` table if enabled, otherwise accepts all domains). This prevents abuse and unauthorized usage.
 
 **Wildcard support**:
 
@@ -411,7 +398,7 @@ let database_url = env::var("DATABASE_URL")
 - Credentials are correct in `DATABASE_URL`
 - Schema is initialized: `psql -d cybertemp -c "\dt"`
 
-#### 3. "Failed to load domains from Supabase"
+#### 3. "Failed to load domains from Supabase" (if using Supabase features)
 
 **Check**:
 
@@ -459,7 +446,8 @@ RUST_LOG=debug ./target/release/cybertemp_smtp
 | **Rust Implementation**       | ✅ **Active**        | Production-ready, actively maintained |
 | **JavaScript Implementation** | ❌ **Abandoned**     | Not maintained, use Rust version      |
 | **PostgreSQL Storage**        | ✅ Production        | Stable and tested                     |
-| **Supabase Integration**      | ✅ Production        | Stable and tested                     |
+| **Self-hosted Inboxes**       | ✅ Production        | No external dependencies              |
+| **Supabase Integration**      | ⚠️ Optional          | For advanced features only            |
 | **Private Email Feature**     | ⚠️ Optional          | Cybertemp-specific, not required      |
 | **Code Quality**              | ⚠️ Needs Refactoring | Works but messy                       |
 | **Documentation**             | ✅ Complete          | You're reading it!                    |
@@ -512,7 +500,7 @@ MIT License - See LICENSE file for details
 
 - Built with ❤️ for the Cybertemp community
 - Powered by Rust 🦀, Tokio, and PostgreSQL
-- Integrated with Supabase for scalable infrastructure
+- Optional Supabase integration for advanced features
 
 ---
 
@@ -520,7 +508,7 @@ MIT License - See LICENSE file for details
   <img src="https://img.shields.io/badge/Rust-000000?style=for-the-badge&logo=rust&logoColor=white"/>
   <img src="https://img.shields.io/badge/PostgreSQL-316192?style=for-the-badge&logo=postgresql&logoColor=white"/>
   <img src="https://img.shields.io/badge/Supabase-181818?style=for-the-badge&logo=supabase&logoColor=white"/>
-  <img src="https://img.shields.io/badge/Production-Ready-success?style=for-the-badge"/>
+  <img src="https://img.shields.io/badge/Self--Hosted-Ready-success?style=for-the-badge"/>
 </p>
 
 <div align="center">

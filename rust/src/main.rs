@@ -32,8 +32,8 @@ struct BansCache {
     domain: HashSet<String>,
 }
 
-// Supabase inbox structure
-#[derive(Debug, Deserialize, Serialize)]
+// PostgreSQL inbox structure (no longer using Supabase)
+#[derive(Debug, Deserialize, Serialize, sqlx::FromRow)]
 struct Inbox {
     id: String,
     email_address: String,
@@ -72,6 +72,14 @@ async fn main() -> anyhow::Result<()> {
     let supabase_key = env::var("SUPABASE_SERVICE_ROLE_KEY")
         .or_else(|_| env::var("SUPABASE_KEY"))?;
     let heartbeat_url = env::var("HEARTBEAT_URL").ok();
+    let use_supabase_bans: bool = env::var("USE_SUPABASE_BANS")
+        .unwrap_or_else(|_| "true".to_string())
+        .parse()
+        .unwrap_or(true);
+    let use_supabase_domains: bool = env::var("USE_SUPABASE_DOMAINS")
+        .unwrap_or_else(|_| "true".to_string())
+        .parse()
+        .unwrap_or(true);
     let listen_port: u16 = env::var("SMTP_RECEIVE_PORT").unwrap_or("25".into()).parse()?;
 
     // Create PostgreSQL connection pool for temporary emails
@@ -90,30 +98,43 @@ async fn main() -> anyhow::Result<()> {
     // Bans cache (email exact, contains, domain)
     let bans_cache: Arc<RwLock<BansCache>> = Arc::new(RwLock::new(BansCache::default()));
     
-    // Initialize domain whitelist from Supabase
-    if let Err(e) = load_domain_whitelist(&supabase_url, &supabase_key, domain_whitelist.clone()).await {
-        warn!("✗ Failed to load domain whitelist: {}", e);
+    // Initialize domain whitelist from Supabase (if enabled)
+    if use_supabase_domains {
+        if let Err(e) = load_domain_whitelist(&supabase_url, &supabase_key, domain_whitelist.clone()).await {
+            warn!("✗ Failed to load domain whitelist: {}", e);
+        }
+    } else {
+        info!("✓ Supabase domains disabled - accepting all domains");
     }
 
-    // Perform an initial synchronous load of bans (same pattern as domains)
-    // so bans are populated before the listener starts, mirroring domain behavior.
-    load_bans(&supabase_url, &supabase_key, bans_cache.clone()).await;
+    // Initialize bans from Supabase (if enabled)
+    if use_supabase_bans {
+        // Perform an initial synchronous load of bans (same pattern as domains)
+        // so bans are populated before the listener starts, mirroring domain behavior.
+        load_bans(&supabase_url, &supabase_key, bans_cache.clone()).await;
+    } else {
+        info!("✓ Supabase bans disabled - no external bans loaded");
+    }
 
-    // Start domain updates polling
-    let whitelist_clone = domain_whitelist.clone();
-    let supabase_url_clone = supabase_url.clone();
-    let supabase_key_clone = supabase_key.clone();
-    tokio::spawn(async move {
-        poll_domain_updates(supabase_url_clone, supabase_key_clone, whitelist_clone).await;
-    });
+    // Start domain updates polling (if enabled)
+    if use_supabase_domains {
+        let whitelist_clone = domain_whitelist.clone();
+        let supabase_url_clone = supabase_url.clone();
+        let supabase_key_clone = supabase_key.clone();
+        tokio::spawn(async move {
+            poll_domain_updates(supabase_url_clone, supabase_key_clone, whitelist_clone).await;
+        });
+    }
 
-    // Start bans polling (initial load + periodic refresh)
-    let bans_cache_clone = bans_cache.clone();
-    let supabase_url_clone2 = supabase_url.clone();
-    let supabase_key_clone2 = supabase_key.clone();
-    tokio::spawn(async move {
-        poll_bans(supabase_url_clone2, supabase_key_clone2, bans_cache_clone).await;
-    });
+    // Start bans polling (if enabled)
+    if use_supabase_bans {
+        let bans_cache_clone = bans_cache.clone();
+        let supabase_url_clone2 = supabase_url.clone();
+        let supabase_key_clone2 = supabase_key.clone();
+        tokio::spawn(async move {
+            poll_bans(supabase_url_clone2, supabase_key_clone2, bans_cache_clone).await;
+        });
+    }
 
     // Concurrency control
     let semaphore = Arc::new(Semaphore::new(10));
@@ -194,7 +215,7 @@ async fn handle_smtp(
             if cmd == "." {
                 data_mode = false;
                 info!("[SMTP IN] DATA stream completed");
-                match process_email(&email_data, &rcpt_to, &mail_from, &postgres_pool, &supabase_url, &supabase_key, &whitelist, heartbeat_url.clone(), &bans_cache).await {
+                match process_email(&email_data, &rcpt_to, &mail_from, &postgres_pool, &whitelist, heartbeat_url.clone(), &bans_cache).await {
                     Ok(_) => {
                         writer.write_all(b"250 Ok: Message accepted\r\n").await?;
                         info!("✓ Email processed successfully");
@@ -288,8 +309,6 @@ async fn process_email(
     rcpt_to: &str,
     mail_from: &str,
     postgres_pool: &PgPool,
-    supabase_url: &str,
-    supabase_key: &str,
     whitelist: &Arc<Mutex<HashSet<String>>>,
     heartbeat_url: Option<String>,
     bans_cache: &Arc<RwLock<BansCache>>,
@@ -376,8 +395,8 @@ async fn process_email(
                             .execute(postgres_pool)
                             .await;
 
-                        if let Some(url) = heartbeat_url {
-                            send_heartbeat(&url).await;
+                        if heartbeat_url.is_some() {
+                            send_heartbeat(&heartbeat_url.as_ref().unwrap()).await;
                         }
                         return Ok(());
                     }
@@ -393,12 +412,11 @@ async fn process_email(
     }
 
     // Handle as temp email - save to PostgreSQL
-    let client = Client::new();
 
     // Get or create inbox and parse email in parallel
     let raw_email_clone = raw_email.clone();
     let ( _ , parsed_result ) = tokio::join!(
-        get_or_create_inbox(&client, supabase_url, supabase_key, &recipient_email),
+        get_or_create_inbox_pg(postgres_pool, &recipient_email),
         tokio::task::spawn_blocking(move || {
             let data = raw_email_clone;
             let bodies_result = match parse_mail(data.as_bytes()) {
@@ -495,8 +513,8 @@ async fn process_email(
                 }
             }
 
-            if let Some(url) = heartbeat_url {
-                send_heartbeat(&url).await;
+            if heartbeat_url.is_some() {
+                send_heartbeat(&heartbeat_url.as_ref().unwrap()).await;
             }
 
             return Ok(());
@@ -538,8 +556,8 @@ async fn process_email(
                 }
             }
 
-            if let Some(url) = heartbeat_url {
-                send_heartbeat(&url).await;
+            if heartbeat_url.is_some() {
+                send_heartbeat(&heartbeat_url.as_ref().unwrap()).await;
             }
 
             return Ok(());
@@ -573,8 +591,8 @@ async fn process_email(
         }
     }
 
-    if let Some(url) = heartbeat_url {
-        send_heartbeat(&url).await;
+    if heartbeat_url.is_some() {
+        send_heartbeat(&heartbeat_url.as_ref().unwrap()).await;
     }
 
     Ok(())
@@ -633,64 +651,46 @@ fn strip_email_headers(raw_email: &str) -> String {
     }
 }
 
-async fn get_or_create_inbox(client: &Client, supabase_url: &str, supabase_key: &str, email: &str) -> anyhow::Result<String> {
-    let api_url = format!("{}/rest/v1/inbox?email_address=eq.{}", supabase_url, email);
-    match client
-        .get(&api_url)
-        .header("apikey", supabase_key)
-        .header("Authorization", format!("Bearer {}", supabase_key))
-        .send()
-        .await {
-            Ok(response) => {
-                match response.json::<Vec<Inbox>>().await {
-                    Ok(inbox_res) => {
-                        if let Some(inbox) = inbox_res.first() {
-                            return Ok(inbox.id.clone());
-                        }
-                    }
-                    Err(e) => {
-                        warn!("⚠ Failed to parse Supabase response: {}", e);
-                        return Err(anyhow::anyhow!("Supabase parse error: {}", e));
-                    }
-                }
-            }
-            Err(e) => {
-                warn!("⚠ Failed to check Supabase inbox: {}", e);
-                return Err(anyhow::anyhow!("Supabase connection error: {}", e));
-            }
-        }
+// PostgreSQL-based inbox management (replaces Supabase)
+async fn get_or_create_inbox_pg(postgres_pool: &PgPool, email: &str) -> anyhow::Result<String> {
+    // Try to find existing inbox
+    let result = sqlx::query_as::<_, (String,)>(
+        "SELECT id::text FROM inbox WHERE email_address = $1"
+    )
+    .bind(email)
+    .fetch_optional(postgres_pool)
+    .await;
 
-    // Create new inbox if it doesn't exist (user_id can be None)
-    let create_url = format!("{}/rest/v1/inbox", supabase_url);
-    match client
-        .post(&create_url)
-        .header("apikey", supabase_key)
-        .header("Authorization", format!("Bearer {}", supabase_key))
-        .header("Content-Type", "application/json")
-        .header("Prefer", "return=representation")
-        .json(&serde_json::json!({ "email_address": email }))
-        .send()
-        .await {
-            Ok(response) => {
-                match response.json::<Vec<Inbox>>().await {
-                    Ok(created) => {
-                        let inbox_id = created.first()
-                            .ok_or_else(|| anyhow::anyhow!("Failed to create inbox"))?
-                            .id.clone();
-                        info!("✓ Created inbox in Supabase: {}", inbox_id);
-                        Ok(inbox_id)
-                    }
-                    Err(e) => {
-                        warn!("⚠ Failed to parse Supabase creation response: {}", e);
-                        Err(anyhow::anyhow!("Supabase creation parse error: {}", e))
-                    }
+    match result {
+        Ok(Some((inbox_id,))) => {
+            // Inbox exists
+            return Ok(inbox_id);
+        }
+        Ok(None) => {
+            // Inbox doesn't exist, create it
+            let insert_result = sqlx::query_as::<_, (String,)>(
+                "INSERT INTO inbox (email_address) VALUES ($1) RETURNING id::text"
+            )
+            .bind(email)
+            .fetch_one(postgres_pool)
+            .await;
+
+            match insert_result {
+                Ok((inbox_id,)) => {
+                    info!("✓ Created inbox in PostgreSQL: {}", inbox_id);
+                    Ok(inbox_id)
+                }
+                Err(e) => {
+                    error!("Failed to create inbox in PostgreSQL: {:?}", e);
+                    Err(anyhow::anyhow!("PostgreSQL inbox creation error: {}", e))
                 }
             }
-            Err(e) => {
-                warn!("⚠ Failed to create Supabase inbox: {}", e);
-                Err(anyhow::anyhow!("Supabase creation error: {}", e))
-            }
         }
+        Err(e) => {
+            error!("Error checking inbox in PostgreSQL: {:?}", e);
+            Err(anyhow::anyhow!("PostgreSQL inbox query error: {}", e))
+        }
+    }
 }
 
 async fn send_heartbeat(url: &str) {
